@@ -1,13 +1,21 @@
+// Pump.fun Sharpe Sprint entry v2.
+//
 // Sharpe-first paper bot for the agent-fun/replay/v2 pump.fun replay.
 //
-// One small momentum-filtered buy per coin, then a whole-position exit on take
-// profit (+12%), stop loss (-10%) or a time limit, and never re-enter the coin.
-// Quick small round trips on many coins: steady edge beats one moonshot, and
-// the drawdown cap stays far below 50% because every position is tiny and
-// tightly stopped.
+// v1 lesson: it traded only 9 coins because the entry filter was tight
+// (two buys in a 50-slot window, net buying, rising price, >= 2 SOL reserve).
+// Guardrails need 20+ distinct mints with round trips of at least 0.01 SOL.
 //
-// Deterministic by construction: a pure function of the batch stream, no
-// clock, no environment, no Math.random, nothing but insertion-ordered maps.
+// v2 trades a capped number of distinct coins (~30, margin above the 20-mint
+// guardrail): small (~0.01 SOL) buys on a momentum entry filter evaluated over
+// every coin's tape, whole-position exits at take profit / stop loss / time
+// limit, no re-entry. Distinct-coin count is what matters, not trade count, so
+// entries are capped once breadth is comfortable. Tiny positions + tight stops
+// keep drawdown far under 50%; a moonshot-sized loser is what destroys Sharpe,
+// so losers are cut fast.
+//
+// Deterministic by construction: a pure function of the batch stream, no clock,
+// no environment, no Math.random, insertion-ordered maps only.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
@@ -17,7 +25,7 @@ const LAMPORTS = 1_000_000_000;
 const CURVE_FEE_BPS = 125;
 
 export interface Params {
-  /** SOL spent per entry buy. */
+  /** SOL spent per entry buy (adaptive down to the per-mint order cap). */
   buySol: number;
   /** Smallest buy worth sending (round trips must be at least 0.01 SOL). */
   minBuySol: number;
@@ -27,9 +35,9 @@ export interface Params {
   stopLoss: number;
   /** Latest slot a position may be held before a time-limit exit. */
   maxHoldSlots: number;
-  /** A coin needs this much real SOL reserve so the 1% order cap allows our buy. */
+  /** Min real SOL reserve on the coin so the 1% order cap allows our buy. */
   minRqSol: number;
-  /** Tape window in slots for the momentum entry filter. */
+  /** Tape window in slots for the entry filter. */
   window: number;
   /** Minimum buy trades in the window. */
   minBuys: number;
@@ -39,20 +47,23 @@ export interface Params {
   minPriceUp: number;
   /** Buy slippage tolerance (bps); sells go out at market. */
   buySlipBps: number;
+  /** Stop entering new coins once this many distinct round trips are underway. */
+  maxEntries: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
-  buySol: 0.05,
+  buySol: 0.012,
   minBuySol: 0.01,
-  takeProfit: 1.12,
-  stopLoss: 0.90,
-  maxHoldSlots: 1500,
-  minRqSol: 2,
-  window: 50,
+  takeProfit: 1.06,
+  stopLoss: 0.94,
+  maxHoldSlots: 300,
+  minRqSol: 1,
+  window: 200,
   minBuys: 2,
-  minNetSol: 0,
-  minPriceUp: 0,
+  minNetSol: 0.3,
+  minPriceUp: 0.01,
   buySlipBps: 500,
+  maxEntries: 30,
 };
 
 interface Trade {
@@ -63,31 +74,32 @@ interface Trade {
 }
 
 interface Tape {
-  created: number | null;
   trades: Trade[];
 }
 
 interface Held {
   opened: number;   // slot the entry buy was decided on
   exiting: boolean; // a sell order is in flight
+  seen: boolean;    // the bought position has appeared in state.account.positions
 }
 
 export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
   const tapes = new Map<Pubkey, Tape>();
   const held = new Map<Pubkey, Held>();
-  const retired = new Set<Pubkey>(); // coins that already had their one position
+  const retired = new Set<Pubkey>(); // coins whose round trip is done
   const keep = Math.max(p.window, p.maxHoldSlots) + 100;
+  let entries = 0; // distinct coins entered (capped for breadth vs. Sharpe trade-off)
 
   const tapeOf = (mint: Pubkey): Tape => {
     let t = tapes.get(mint);
     if (t === undefined) {
-      t = { created: null, trades: [] };
+      t = { trades: [] };
       tapes.set(mint, t);
     }
     return t;
   };
 
-  /** Momentum entry filter on a coin's tape at slot `now`. */
+  /** Entry filter on a coin's tape at slot `now`. Momentum, loosened for breadth. */
   const entrySignal = (t: Tape, now: number): boolean => {
     const from = now - p.window;
     let startPrice = -1;
@@ -126,10 +138,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       // Fold this batch's trades into the tapes, in event order.
       const traded: Pubkey[] = [];
       for (const e of batch.events) {
-        if (e.event === 'CreateEvent') {
-          const t = tapeOf(e.mint);
-          if (t.created === null) t.created = e.slot;
-        } else if (e.event === 'TradeEvent') {
+        if (e.event === 'TradeEvent') {
           const t = tapeOf(e.mint);
           const vq = Number(e.virtual_quote_reserves);
           const vt = Number(e.virtual_token_reserves);
@@ -162,14 +171,18 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       for (const [mint, h] of held) {
         const pos = positions.find((x) => x.mint === mint);
         if (pos === undefined) {
-          // Sold (or flattened by the replay at done): never trade this coin again.
-          held.delete(mint);
-          retired.add(mint);
+          if (h.seen) {
+            // Position was held and is now gone (sell filled / flattened): done with the coin.
+            held.delete(mint);
+            retired.add(mint);
+          }
+          // else: position not yet visible after our entry buy; wait for it to appear.
           continue;
         }
+        h.seen = true;
         if (h.exiting && pendingByMint.has(mint)) continue;
-        const curve = state.curves.get(mint);
         const mark = batch.marks.find((m) => m.mint === mint);
+        const curve = state.curves.get(mint);
         const vq = mark === undefined ? (curve === undefined ? 0n : curve.virtual_quote_reserves)
           : BigInt(mark.virtual_quote_reserves);
         const vt = mark === undefined ? (curve === undefined ? 0n : curve.virtual_token_reserves)
@@ -191,33 +204,40 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         h.exiting = true;
       }
 
-      // ---- Entries: one small buy per coin passing the momentum filter. ----
-      let free = Number(state.freeCashLamports()) / LAMPORTS;
-      let slotsLeft = caps.max_open_positions - state.committedPositionCount();
-      const buyLamports = p.buySol * LAMPORTS;
-      const minBuyLamports = p.minBuySol * LAMPORTS;
+      // ---- Entries: small buys on coins passing the momentum filter.
+      // Scan every known tape so a coin that qualified while its reserve was
+      // still low gets entered once the cap allows. Entries are capped at
+      // p.maxEntries: breadth (20+ distinct coins) is the goal, not trade count.
+      // ----
+      if (entries < p.maxEntries) {
+        let free = Number(state.freeCashLamports()) / LAMPORTS;
+        let slotsLeft = caps.max_open_positions - state.committedPositionCount();
+        const buyLamports = p.buySol * LAMPORTS;
+        const minBuyLamports = p.minBuySol * LAMPORTS;
 
-      for (const mint of traded) {
-        if (orders.length >= cap || slotsLeft <= 0) break;
-        if (held.has(mint) || retired.has(mint) || pendingByMint.has(mint)) continue;
-        const curve = state.curves.get(mint);
-        if (curve === undefined || curve.complete) continue;
-        if (Number(curve.real_quote_reserves) / LAMPORTS < p.minRqSol) continue;
-        const t = tapeOf(mint);
-        if (!entrySignal(t, now)) continue;
-        let amount = Math.min(buyLamports, Number(state.maxBuyLamports(mint)));
-        amount = Math.min(amount, free * LAMPORTS - Number(txFee));
-        if (amount < minBuyLamports) continue;
-        if (orders.length >= cap) break;
-        orders.push({
-          side: 'buy',
-          mint,
-          quote_lamports: BigInt(Math.floor(amount)),
-          max_slippage_bps: p.buySlipBps,
-        });
-        free -= amount / LAMPORTS + Number(txFee) / LAMPORTS;
-        slotsLeft -= 1;
-        held.set(mint, { opened: now, exiting: false });
+        for (const [mint, t] of tapes) {
+          if (entries >= p.maxEntries || orders.length >= cap || slotsLeft <= 0) break;
+          if (held.has(mint) || retired.has(mint) || pendingByMint.has(mint)) continue;
+          const curve = state.curves.get(mint);
+          if (curve === undefined || curve.complete) continue;
+          const reserve = Number(curve.real_quote_reserves) / LAMPORTS;
+          if (reserve < p.minRqSol) continue;
+          if (!entrySignal(t, now)) continue;
+          let amount = Math.min(buyLamports, Number(state.maxBuyLamports(mint)));
+          amount = Math.min(amount, free * LAMPORTS - Number(txFee));
+          if (amount < minBuyLamports) continue;
+          if (orders.length >= cap) break;
+          orders.push({
+            side: 'buy',
+            mint,
+            quote_lamports: BigInt(Math.floor(amount)),
+            max_slippage_bps: p.buySlipBps,
+          });
+          free -= amount / LAMPORTS + Number(txFee) / LAMPORTS;
+          slotsLeft -= 1;
+          entries += 1;
+          held.set(mint, { opened: now, exiting: false, seen: false });
+        }
       }
       return orders;
     },
